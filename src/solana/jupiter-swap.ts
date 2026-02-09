@@ -7,25 +7,38 @@ import {
 
 const swapAgentUrl = "https://api3.privacycash.org/swap";
 
+export type JupSwapResp = {
+  /**
+   * destination token amount after swap
+   */
+  outAmount: string;
+  /**
+   * base64 data
+   */
+  transaction: string;
+  requestId: string;
+};
+
 export async function jupSwap(
   inputMint: PublicKey,
   outputMint: PublicKey,
   base_unites: number,
   burnerKeypair: Keypair,
   connection: Connection,
-) {
+): Promise<JupSwapResp> {
   console.log("[RUBIC] buildSwapTx params", {
     inputMint: inputMint.toString(),
     outputMint: outputMint.toString(),
     base_unites,
     burnerKeypair: burnerKeypair.publicKey.toString(),
   });
-  let orderResponse = await buildSwapTx(
+  let orderResponse: JupSwapResp = await buildSwapTx(
     base_unites,
     inputMint.toString(),
     outputMint.toString(),
     burnerKeypair.publicKey.toString(),
   );
+
   const transaction = VersionedTransaction.deserialize(
     Buffer.from(orderResponse.transaction, "base64"),
   );
@@ -42,12 +55,16 @@ export async function jupSwap(
     burnerKeypair: burnerKeypair.publicKey.toString(),
   });
   // swap execute
-  let tx = await makeSwapTx(
+  let makeSwapResp = await makeSwapTx(
     signedTxBase64,
     orderResponse.requestId,
     burnerKeypair,
   );
-  await connection.confirmTransaction(tx, "confirmed");
+  console.log("[RUBIC] jupSwap_makeSwapTx resp", makeSwapResp);
+
+  // await connection.confirmTransaction(tx, "confirmed");
+
+  return orderResponse;
 }
 
 // get swap quote
@@ -56,7 +73,7 @@ export async function buildSwapTx(
   inputMint: string,
   outputMint: string,
   takerAddress = "",
-) {
+): Promise<JupSwapResp> {
   if (baseUnites <= 0) {
     throw new Error("baseUnites must be greater than 0");
   }
@@ -68,6 +85,7 @@ export async function buildSwapTx(
     taker: takerAddress,
   };
   console.log(`[RUBIC] fetching ${swapAgentUrl} with params:`, params);
+
   let res = await fetch(swapAgentUrl, {
     method: "POST",
     headers: {
@@ -76,16 +94,20 @@ export async function buildSwapTx(
     body: JSON.stringify(params),
   });
   console.log("got response");
-  let json = await res.json();
-  if (!json.success) {
-    console.log("[RUBIC] buildSwapTx error", json);
-    throw new Error(json.error);
-  }
-  console.log("[RUBIC] buildSwapTx success", json.orderResponse);
 
-  if (json.orderResponse.error) {
-    throw new Error(json.error);
+  let json = await res.json();
+  if (
+    !json.success ||
+    json.orderResponse.error ||
+    !json.orderResponse.outAmount
+  ) {
+    console.log("[RUBIC] buildSwapTx error", json);
+    await new Promise((res) => setTimeout(res, 1_000));
+    console.log("[RUBIC] RETRYING buildSwapTx...");
+    return buildSwapTx(baseUnites, inputMint, outputMint, takerAddress);
   }
+
+  console.log("[RUBIC] buildSwapTx success", json.orderResponse);
 
   return json.orderResponse;
 }
@@ -111,9 +133,12 @@ async function makeSwapTx(
 
   let json = await res.json();
   if (!json.success) {
-    throw new Error(json.error);
+    await new Promise((res) => setTimeout(res, 1_000));
+    console.log("[RUBIC] RETRYING makeSwapTx...");
+    return makeSwapTx(signedTransaction, requestId, burnerKeypair);
   }
-  console.log("[RUBIC] jup swap: res", json);
+
+  console.log("[RUBIC] makeSwapTx success", json);
 
   return json.exeRes.signature;
 }

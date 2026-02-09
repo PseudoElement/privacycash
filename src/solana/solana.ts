@@ -2,7 +2,11 @@ import { WasmFactory } from "@lightprotocol/hasher.rs";
 import {
   Connection,
   Keypair,
+  LAMPORTS_PER_SOL,
   PublicKey,
+  sendAndConfirmTransaction,
+  SystemProgram,
+  Transaction,
   VersionedTransaction,
 } from "@solana/web3.js";
 import {
@@ -17,11 +21,13 @@ import {
   getBalanceFromUtxosSPL,
 } from "privacycash/utils";
 import path from "node:path";
-import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import {
+  getAssociatedTokenAddressSync,
+  TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
 import { jupSwap } from "./jupiter-swap";
 
-const SOLANA_ADDRESS = "So11111111111111111111111111111111111111112";
-const REFERRER_ADDRESS = "HCEv8CCq5i6ob7iXpHuGpv1L89pZStycPBeXSi37b7nH";
+export const SOLANA_ADDRESS = "So11111111111111111111111111111111111111112";
 const swap_reserved_rent_fee = 0.0033;
 
 const addr_to_symbol_map: Record<string, string> = {
@@ -39,6 +45,7 @@ export async function swapPrivately() {
   const dstAddr = document.querySelectorAll("input")[1].value;
   const srcAmount = document.querySelectorAll("input")[2].value;
   const srcDecimals = document.querySelectorAll("input")[3].value;
+  const receiver = document.querySelectorAll("input")[5].value;
 
   const srcAmountWei = toWei(Number(srcAmount), Number(srcDecimals));
 
@@ -62,13 +69,27 @@ export async function swapPrivately() {
   const encryptionService = new EncryptionService();
   encryptionService.deriveEncryptionKeyFromSignature(signature);
 
-  await makeDeposit(srcAddr, srcAmountWei, encryptionService, connection);
+  const wallet = window.solana;
+  const walletPK = new PublicKey(wallet.publicKey.toBytes());
+
+  await makeDeposit(
+    srcAddr,
+    srcAmountWei,
+    encryptionService,
+    connection,
+    walletPK,
+    async (tx: VersionedTransaction) => {
+      return await wallet.signTransaction(tx);
+    },
+  );
   if (srcAddr === dstAddr) {
     await makeDirectWithdraw(
       srcAddr,
       Number(srcDecimals),
       encryptionService,
       connection,
+      walletPK,
+      new PublicKey(receiver),
     );
   } else {
     await makeSwapAndWithdraw(encryptionService, connection, signature);
@@ -80,9 +101,11 @@ async function makeDeposit(
   depositAmountWei: number,
   encryptionService: EncryptionService,
   connection: Connection,
+  depositorWalletPK: PublicKey,
+  transactionSignerFn: (
+    tx: VersionedTransaction,
+  ) => Promise<VersionedTransaction>,
 ): Promise<void> {
-  const wallet = window.solana;
-
   const lightWasm = await WasmFactory.getInstance();
   const pathToZkProof = path.join(
     import.meta.dirname,
@@ -99,10 +122,9 @@ async function makeDeposit(
         amount_in_lamports: depositAmountWei,
         connection,
         encryptionService,
-        publicKey: new PublicKey(wallet.publicKey.toBytes()),
-        transactionSigner: async (tx: VersionedTransaction) => {
-          return await window.solana.signTransaction(tx);
-        },
+        publicKey: depositorWalletPK,
+        signer: depositorWalletPK,
+        transactionSigner: transactionSignerFn,
         keyBasePath: pathToZkProof,
         storage: localStorage,
       });
@@ -112,10 +134,9 @@ async function makeDeposit(
         base_units: depositAmountWei,
         connection,
         encryptionService,
-        publicKey: new PublicKey(wallet.publicKey.toBytes()),
-        transactionSigner: async (tx: VersionedTransaction) => {
-          return await window.solana.signTransaction(tx);
-        },
+        publicKey: depositorWalletPK,
+        signer: depositorWalletPK,
+        transactionSigner: transactionSignerFn,
         keyBasePath: pathToZkProof,
         storage: localStorage,
         mintAddress: tokenAddr,
@@ -133,28 +154,26 @@ async function makeDirectWithdraw(
   tokenDecimals: number,
   encryptionService: EncryptionService,
   connection: Connection,
+  srcWalletPK: PublicKey,
+  recipientPK: PublicKey,
 ): Promise<void> {
-  const wallet = window.solana;
-
-  const receiverAddr = document.querySelectorAll("input")[5].value;
-
   const tokenPrivateBalanceWei = await getBalanceOnPrivateCash(
     tokenAddr,
     encryptionService,
     connection,
+    srcWalletPK,
   );
   const tokenPrivateBalance = fromWei(
     tokenPrivateBalanceWei,
     Number(tokenDecimals),
   );
 
-  console.log("[RUBIC] src balances:", {
+  console.log(`[RUBIC] ${tokenAddr} private balance to withdraw:`, {
     tokenPrivateBalanceWei,
     tokenPrivateBalance,
+    srcWallet: srcWalletPK.toBase58(),
+    recipientWallet: recipientPK.toBase58(),
   });
-
-  const publicKey = new PublicKey(wallet.publicKey.toBytes());
-  const recipient = new PublicKey(receiverAddr);
 
   const lightWasm = await WasmFactory.getInstance();
   const pathToZkProof = path.join(
@@ -172,8 +191,8 @@ async function makeDirectWithdraw(
         amount_in_lamports: tokenPrivateBalanceWei,
         connection,
         encryptionService,
-        publicKey,
-        recipient,
+        publicKey: srcWalletPK,
+        recipient: recipientPK,
         keyBasePath: pathToZkProof,
         storage: localStorage,
       });
@@ -183,8 +202,8 @@ async function makeDirectWithdraw(
         base_units: tokenPrivateBalanceWei,
         connection,
         encryptionService,
-        publicKey,
-        recipient,
+        publicKey: srcWalletPK,
+        recipient: recipientPK,
         keyBasePath: pathToZkProof,
         storage: localStorage,
         mintAddress: tokenAddr,
@@ -202,83 +221,157 @@ async function makeSwapAndWithdraw(
   connection: Connection,
   signature: Uint8Array<ArrayBufferLike>,
 ): Promise<void> {
-  const wallet = window.solana;
-  const publicKey = new PublicKey(wallet.publicKey.toBytes());
-
   const srcTokenAddr = document.querySelectorAll("input")[0].value;
   const dstTokenAddr = document.querySelectorAll("input")[1].value;
   const srcDecimals = document.querySelectorAll("input")[3].value;
   const dstDecimals = document.querySelectorAll("input")[4].value;
+  const receiver = document.querySelectorAll("input")[5].value;
+
+  const userWalletPK = new PublicKey(window.solana.publicKey.toBytes());
+  const receiverPK = new PublicKey(receiver);
 
   const burnerKeypair = await deriveSolanaKeypairFromEncryptionKeyBase58(
     signature,
-    publicKey,
+    userWalletPK,
     0,
   );
+  console.log(`[RUBIC] burnerKeypair generated ==>`, {
+    publicKey: burnerKeypair.publicKey.toBase58(),
+    secretKey: burnerKeypair.secretKey.toString(),
+    secretBuffer: JSON.stringify(burnerKeypair.secretKey.buffer),
+  });
+  localStorage.setItem("PRIVATE_KEY", burnerKeypair.secretKey.toString());
 
+  const srcTokenBurnerBalanceBeforeWithdraw = await getBurnerBalance(
+    srcTokenAddr,
+    burnerKeypair,
+    connection,
+  );
+  console.log(
+    "[RUBIC] srcTokenBurnerBalanceBeforeWithdraw before withdraw ==>",
+    srcTokenBurnerBalanceBeforeWithdraw,
+  );
+
+  // withdraw src coin to burner wallet
   await makeDirectWithdraw(
     srcTokenAddr,
     Number(srcDecimals),
     encryptionService,
     connection,
+    userWalletPK,
+    burnerKeypair.publicKey,
   );
-  console.log("[RUBIC] after makeDirectWithdraw");
+  console.log("[RUBIC] after withdraw ==>", {
+    from: userWalletPK.toBase58(),
+    to: burnerKeypair.publicKey.toBase58(),
+  });
 
-  const swapAmount = await getAmountForJupiterSwap(
+  // const srcTokenBurnerBalance = await getBurnerBalance(
+  //   srcTokenAddr,
+  //   burnerKeypair,
+  //   connection,
+  // );
+  const srcTokenBurnerBalance = await waitForUpdatedBurnerWalletBalance(
     srcTokenAddr,
-    encryptionService,
+    srcTokenBurnerBalanceBeforeWithdraw,
+    burnerKeypair,
     connection,
   );
-  console.log("[RUBIC] swapAmount ==>", swapAmount);
+  console.log(
+    `[RUBIC] srcTokenBurnerBalance after withdraw ==>`,
+    srcTokenBurnerBalance,
+  );
 
-  const prevBurnerBalance = await getBurnerBalance(
+  const dstTokenBurnerBalance = await getBurnerBalance(
     dstTokenAddr,
     burnerKeypair,
     connection,
   );
-  console.log("[RUBIC] prevBurnerBalance ==>", prevBurnerBalance);
+  console.log(
+    `[RUBIC] dstTokenBurnerBalance ${dstTokenBurnerBalance} ==>`,
+    dstTokenBurnerBalance,
+  );
 
-  console.log("[RUBIC] before jupSwap ==>", { srcTokenAddr, dstTokenAddr });
+  const swapAmount = await getAmountWithoutFees(
+    srcTokenAddr,
+    srcTokenBurnerBalance,
+  );
+  console.log("[RUBIC] swapAmount ==>", swapAmount);
 
-  await jupSwap(
+  // if (swapAmount > srcTokenBurnerBalance) {
+  //   console.log("[RUBIC] FAIL: swapAmount > srcTokenBurnerBalance");
+  //   console.log("Making withdrawal...");
+  //   await makeDirectWithdraw(
+  //     srcTokenAddr,
+  //     Number(srcDecimals),
+  //     encryptionService,
+  //     connection,
+  //     burnerKeypair.publicKey,
+  //     userWalletPK,
+  //   );
+  //   console.log("Successfull withdrawal!");
+  //   return;
+  // }
+
+  console.log("[RUBIC] before jupSwap ==>", {
+    fromToken: srcTokenAddr,
+    toToken: dstTokenAddr,
+    srcWallet: burnerKeypair.publicKey.toBase58(),
+    recepientWallet: burnerKeypair.publicKey.toBase58(),
+  });
+  // swap on burner wallet srcToken -> dstToken
+  const swapResp = await jupSwap(
     new PublicKey(srcTokenAddr),
     new PublicKey(dstTokenAddr),
     swapAmount,
     burnerKeypair,
     connection,
   );
-
-  console.log("[RUBIC] after jupSwap ==>");
+  console.log("[RUBIC] after jupSwap ==>", swapResp);
 
   const newBurnerBalance = await waitForUpdatedBurnerWalletBalance(
     dstTokenAddr,
-    prevBurnerBalance,
+    dstTokenBurnerBalance,
     burnerKeypair,
     connection,
   );
   console.log("[RUBIC] newBurnerBalance ==>", newBurnerBalance);
 
-  const finalDepositAmount =
-    dstTokenAddr === SOLANA_ADDRESS
-      ? newBurnerBalance - swap_reserved_rent_fee * 1e9
-      : newBurnerBalance;
-  console.log("[RUBIC] finalDepositAmount ==>", finalDepositAmount);
+  const dstTokenDepositAmount = await getAmountWithoutFees(
+    dstTokenAddr,
+    newBurnerBalance,
+  );
+  console.log("[RUBIC] dstTokenDepositAmount ==>", dstTokenDepositAmount);
 
+  await new Promise((res) => setTimeout(res, 15_000));
+
+  // deposit destination token from burner wallet
   await makeDeposit(
     dstTokenAddr,
-    finalDepositAmount,
+    dstTokenDepositAmount,
     encryptionService,
     connection,
+    burnerKeypair.publicKey,
+    (tx: VersionedTransaction) => {
+      tx.sign([burnerKeypair]);
+      return Promise.resolve(tx);
+    },
   );
-  console.log("[RUBIC] after final makeDeposit ==>", finalDepositAmount);
+  console.log(
+    "[RUBIC] after deposit from ==>",
+    burnerKeypair.publicKey.toBase58(),
+  );
 
+  // withdraw from burner to target receiver address
   await makeDirectWithdraw(
     dstTokenAddr,
     Number(dstDecimals),
     encryptionService,
     connection,
+    burnerKeypair.publicKey,
+    receiverPK,
   );
-  console.log("[RUBIC] after final makeDirectWithdraw ==>", finalDepositAmount);
+  console.log("[RUBIC] after final makeDirectWithdraw ==>");
 }
 
 function fromWei(weiAmount: number, decimals: number): number {
@@ -296,14 +389,12 @@ async function getBalanceOnPrivateCash(
   tokenAddr: string,
   encryptionService: EncryptionService,
   connection: Connection,
+  walletPK: PublicKey,
 ): Promise<number> {
-  const wallet = window.solana;
-  const publicKey = new PublicKey(wallet.publicKey.toBytes());
-
   try {
     if (tokenAddr === SOLANA_ADDRESS) {
       const utxos = await getUtxos({
-        publicKey,
+        publicKey: walletPK,
         connection,
         encryptionService,
         storage: localStorage,
@@ -315,7 +406,7 @@ async function getBalanceOnPrivateCash(
     }
 
     const utxos = await getUtxosSPL({
-      publicKey,
+      publicKey: walletPK,
       connection,
       encryptionService,
       storage: localStorage,
@@ -371,39 +462,43 @@ export async function deriveSolanaKeypairFromEncryptionKeyBase58(
   return Keypair.fromSeed(new Uint8Array(seed));
 }
 
-async function getAmountForJupiterSwap(
+async function getAmountWithoutFees(
   tokenAddr: string,
-  encryptionService: EncryptionService,
-  connection: Connection,
+  tokenBurnerWalletBalanceWei: number,
+  // encryptionService: EncryptionService,
+  // connection: Connection,
+  // burnerKeypair: Keypair,
 ): Promise<number> {
-  const srcTokenPrivateBalance = await getBalanceOnPrivateCash(
-    tokenAddr,
-    encryptionService,
-    connection,
-  );
+  // const srcTokenPrivateBalance = await getBalanceOnPrivateCash(
+  //   tokenAddr,
+  //   encryptionService,
+  //   connection,
+  //   burnerKeypair.publicKey,
+  // );
 
   if (tokenAddr === SOLANA_ADDRESS) {
     const swapAmount =
-      srcTokenPrivateBalance - (swap_reserved_rent_fee + 0.002) * 1e9;
+      tokenBurnerWalletBalanceWei - (swap_reserved_rent_fee + 0.002) * 1e9;
     return swapAmount;
   }
 
-  return srcTokenPrivateBalance;
+  return tokenBurnerWalletBalanceWei;
 }
 
 /**
  * @TODO restrict retries
  */
 async function waitForUpdatedBurnerWalletBalance(
-  dstTokenAddr: string,
+  tokenAddr: string,
   prevBurnerBalance: number,
   burnerKeypair: Keypair,
   connection: Connection,
 ): Promise<number> {
   while (true) {
+    console.log("[RUBIC] WAIT FOR BALANCE UPDATED");
     await new Promise((res) => setTimeout(res, 5_000));
     const newBurnerBalance = await getBurnerBalance(
-      dstTokenAddr,
+      tokenAddr,
       burnerKeypair,
       connection,
     );
@@ -423,14 +518,60 @@ async function getBurnerBalance(
     );
     return nativeBalance.value;
   } else {
-    const ata = getAssociatedTokenAddressSync(
-      new PublicKey(tokenAddr),
-      burnerKeypair.publicKey,
+    // const ata = getAssociatedTokenAddressSync(
+    //   new PublicKey(tokenAddr),
+    //   burnerKeypair.publicKey,
+    // );
+    // const balanceRes = await connection
+    //   .getTokenAccountBalance(ata)
+    //   .catch((err) => {
+    //     console.log("[RUBIC] ERROR ATA getTokenAccountBalance", {
+    //       ata: ata.toBase58(),
+    //       err,
+    //     });
+    //     return { value: { amount: "0" } };
+    //   });
+    // console.log("[RUBIC] ATA getTokenAccountBalance", {});
+    // return parseInt(balanceRes.value.amount);
+    return getTokenBalance(
+      burnerKeypair.publicKey.toBase58(),
+      tokenAddr,
+      connection,
     );
-    const balanceRes = await connection
-      .getTokenAccountBalance(ata)
-      .catch(() => ({ value: { amount: "0" } }));
-    return parseInt(balanceRes.value.amount);
+  }
+}
+
+async function getTokenBalance(
+  address: string,
+  tokenAddr: string,
+  connection: Connection,
+): Promise<number> {
+  try {
+    const resp = await (
+      connection as Connection & {
+        _rpcRequest: (owner: string, data: unknown[]) => any;
+      }
+    )._rpcRequest("getTokenAccountsByOwner", [
+      address,
+      { programId: TOKEN_PROGRAM_ID },
+      { encoding: "jsonParsed" },
+    ]);
+
+    const found = resp.result.value.find(
+      (el: any) =>
+        el.account.data.parsed.info.mint.toLowerCase() ===
+        tokenAddr.toLowerCase(),
+    );
+
+    console.log(
+      `[RUB] found token balance ${tokenAddr} of wallet ${address}`,
+      found,
+    );
+
+    return parseInt(found.account.data.parsed.info.tokenAmount.amount);
+  } catch (err) {
+    console.log("[RUBIC] getTokenBalance ERROR ==>", err);
+    return 0;
   }
 }
 
