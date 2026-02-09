@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>Webpack App</title>
+
+        <style>
+            input {
+                width: 400px;
+                height: 26px;
+                font-size: 24px;
+            }
+        </style>
+    </head>
+    <body
+        style="
+            display: flex;
+            flex-direction: column;
+            justify-content: baseline;
+            gap: 20px;
+        "
+    >
+        <script>
+            window.wbg = {};
+        </script>
+
+        <h1>Privacy cash</h1>
+
+        <div
+            style="
+                display: flex;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+            "
+        >
+            <label for="inp-from">From token</label>
+            <input id="inp-from" type="text" />
+
+            <label for="inp-from">To token</label>
+            <input id="inp-to" type="text" />
+
+            <label for="inp-from">Amount</label>
+            <input id="inp-amount" type="text" />
+
+            <label for="inp-from">From decimals</label>
+            <input id="inp-from-decimals" type="text" />
+
+            <label for="inp-from">To decimals</label>
+            <input id="inp-to-decimals" type="text" />
+
+            <label for="inp-receiver">Recipient</label>
+            <input id="inp-receiver" type="text" />
+
+            <button class="btn-swap">Swap</button>
+        </div>
+    </body>
+</html>
