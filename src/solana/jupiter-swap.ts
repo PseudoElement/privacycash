@@ -67,7 +67,7 @@ export async function buildSwapTx(
     outputMint,
     taker: takerAddress,
   };
-  console.log(`fetching ${swapAgentUrl} with params:`, params);
+  console.log(`[RUBIC] fetching ${swapAgentUrl} with params:`, params);
   let res = await fetch(swapAgentUrl, {
     method: "POST",
     headers: {
@@ -113,7 +113,7 @@ async function makeSwapTx(
   if (!json.success) {
     throw new Error(json.error);
   }
-  console.log("jup swap: res", json);
+  console.log("[RUBIC] jup swap: res", json);
 
   return json.exeRes.signature;
 }
